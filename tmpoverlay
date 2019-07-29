@@ -1,0 +1,124 @@
+#!/bin/sh
+
+usage() {
+    cat << EOF
+usage: tmpoverlay [OPTIONS] SOURCE [DESTINATION]
+
+Create a tmpfs-backed overlayfs for SOURCE, which is one or more directories
+separated by colons. If DESTINATION is specified, mount the result at
+DESTINATION. Otherwise, mount it on top of the last SOURCE.
+
+To free the memory, simply unmount the DESTINATION.
+
+tmpoverlay is not fully race-safe. It tries to match the ownership and
+permissions of the tmpfs to the final SOURCE, but this is done in a step before
+mounting. Therefore, any permission changes immediately before mounting may be
+hidden by the mount.
+
+options:
+  -h        print this help
+  -k        don't clean up temporary directory
+  -o        additional overlayfs mount options
+  -n        pass -n to mount (don't write to /etc/mtab)
+  -t        additional tmpfs mount options
+  -T        temporary directory
+  -v        verbose mode
+
+examples:
+  tmpoverlay / /tmp/my_root    # make a thin copy of root
+  tmpoverlay /etc              # make read-only /etc writable
+EOF
+}
+
+log() {
+    fmt=$1
+    shift
+    printf "tmpoverlay: $fmt\n" "$@" >&2
+}
+
+verb() {
+    if [ -n "$verbose" ]; then
+        log "$@"
+    fi
+}
+
+die() {
+    log "$@"
+    exit 1
+}
+
+args=$(getopt -n tmpoverlay hko:nt:T:v "$@") || { usage >&2; exit 1; }
+eval set -- "$args"
+unset args
+
+unset no_mtab extra_overlayfs_opts tmpfs_opts tmpdir verbose
+while true; do
+    case "$1" in
+        '-h') usage; exit 0;;
+        '-o')
+            [ -n "$2" ] && extra_overlayfs_opts="$extra_overlayfs_opts,$2"
+            shift 2
+            ;;
+        '-n') no_mtab=1; shift;;
+        '-t')
+            [ -n "$2" ] && tmpfs_opts="${tmpfs_opts:+$tmpfs_opts,}$2"
+            shift 2
+            ;;
+        '-T')
+            [ -d "$2" ] || die 'tmpdir "%s" is not a directory' "$2"
+            tmpdir=$2
+            shift 2
+            ;;
+        '-v') verbose=1; shift;;
+        '--') shift; break;;
+        *) die "getopt failure"
+    esac
+done
+
+case "$#" in
+    1) lowerdir=$1 dir=${1##*:};;
+    2) lowerdir=$1 dir=$2;;
+    *) usage >&2; exit 1;;
+esac
+
+ld=
+set -f
+savedIFS=$IFS IFS=:
+for d in $lowerdir; do
+    d=$(realpath -e "$d")
+    [ -d "$d" ] || die 'lowerdir "%s" is not a directory' "$d"
+    ld=$ld:$d
+done
+IFS=$savedIFS
+set +f
+ld=${ld#:}
+[ -d "$dir" ] || die 'destination "%s" is not a directory' "$dir"
+
+err() {
+    if [ -n "$mounted_tmpdir" ]; then
+        umount "$tmpdir" || exit 1
+    fi
+    if [ -n "$tmpdir" ] && [ -n "$created_tmpdir" ]; then
+        rm -r "$tmpdir"
+    fi
+    exit 1
+}
+
+if [ -z "$tmpdir" ]; then
+    tmpdir=$(umask 077; mktemp -d --tmpdir tmpoverlay.XXXXXXXXXX) || exit 1
+    created_tmpdir=1
+    verb 'created tmpdir: %s' "$tmpdir"
+fi
+mount -t tmpfs ${tmpfs_opts:+-o "$tmpfs_opts"} ${verbose:+-v} tmpfs "$tmpdir" || err
+mounted_tmpdir=1
+upperdir="$tmpdir/upper"
+workdir="$tmpdir/work"
+mkdir "$upperdir" "$workdir" || err
+chown --reference="${ld##*:}" "$upperdir" "$workdir"
+chmod --reference="${ld##*:}" "$upperdir" "$workdir"
+
+overlayfs_opts="lowerdir=$ld,upperdir=$upperdir,workdir=$workdir$extra_overlayfs_opts"
+mount -t overlay -o "$overlayfs_opts" ${no_mtab:+-n} ${verbose:+-v} overlay "$dir" || err
+
+umount "$tmpdir" || err
+rm -r "$tmpdir" || err
