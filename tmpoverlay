@@ -2,31 +2,24 @@
 
 usage() {
     cat << EOF
-usage: tmpoverlay [OPTIONS] SOURCE [DESTINATION]
+usage: tmpoverlay [OPTIONS] [SOURCE...] DEST
 
-Create a tmpfs-backed overlayfs for SOURCE, which is one or more directories
-separated by colons. If DESTINATION is specified, mount the result at
-DESTINATION. Otherwise, mount it on top of the last SOURCE.
-
-To free the memory, simply unmount the DESTINATION.
-
-tmpoverlay is not fully race-safe. It tries to match the ownership and
-permissions of the tmpfs to the final SOURCE, but this is done in a step before
-mounting. Therefore, any permission changes immediately before mounting may be
-hidden by the mount.
+Create a tmpfs-backed overlayfs at DEST starting with SOURCEs. If no SOURCE is
+specified, use DEST as the source. To free the memory, simply umount DEST.
 
 options:
-  -h        print this help
-  -k        don't clean up temporary directory
-  -o        additional overlayfs mount options
-  -n        pass -n to mount (don't write to /etc/mtab)
-  -t        additional tmpfs mount options
-  -T        temporary directory
-  -v        verbose mode
+  -c, --no-canonicalize  don't canonicalize paths
+  -h, --help             print this help
+  -o, --overlayfs OPTS   add overlayfs mount options, e.g. redirect_dir/metacopy
+  -n, --no-mtab          don't write to /etc/mtab
+  -N, --mount-name NAME  source name for mount (default "overlay")
+  -t, --tmpfs OPTS       add tmpfs mount options, e.g. size
+  -v, --verbose          verbose mode
 
 examples:
-  tmpoverlay / /tmp/my_root    # make a thin copy of root
+  tmpoverlay / /new_root       # make a thin copy of root
   tmpoverlay /etc              # make read-only /etc writable
+  tmpoverlay /a /b /c /merged  # merge /a, /b, /c, and a fresh tmpfs
 EOF
 }
 
@@ -36,7 +29,7 @@ log() {
     printf "tmpoverlay: $fmt\n" "$@" >&2
 }
 
-verb() {
+logv() {
     if [ -n "$verbose" ]; then
         log "$@"
     fi
@@ -47,78 +40,142 @@ die() {
     exit 1
 }
 
-args=$(getopt -n tmpoverlay hko:nt:T:v "$@") || { usage >&2; exit 1; }
+canon() {
+    if [ -n "$no_canon" ]; then
+        printf '%s\n' "$1"
+    else
+        realpath "$1"
+    fi
+}
+
+my_getopt() {
+    getopt \
+        -l no-canonicalize \
+        -l help \
+        -l overlayfs: \
+        -l no-mtab \
+        -l mount-name: \
+        -l tmpfs: \
+        -l verbose \
+        -n tmpoverlay \
+        -- \
+        cho:nN:t:v \
+        "$@"
+}
+
+args=$(my_getopt "$@") || { usage >&2; exit 1; }
 eval set -- "$args"
 unset args
 
-unset no_mtab extra_overlayfs_opts tmpfs_opts tmpdir verbose
+unset no_canon no_mtab extra_overlayfs_opts tmpfs_opts tmpdir verbose
 while true; do
     case "$1" in
-        '-h') usage; exit 0;;
-        '-o')
+        -c|--no-canonicalize) no_canon=-c; shift;;
+        -h|--help) usage; exit 0;;
+        -o|--overlayfs)
             [ -n "$2" ] && extra_overlayfs_opts="$extra_overlayfs_opts,$2"
             shift 2
             ;;
-        '-n') no_mtab=1; shift;;
-        '-t')
+        -n|--no-mtab) no_mtab=-n; shift;;
+        -N|--mount-name) mount_name=$2; shift 2;;
+        -t|--tmpfs)
             [ -n "$2" ] && tmpfs_opts="${tmpfs_opts:+$tmpfs_opts,}$2"
             shift 2
             ;;
-        '-T')
-            [ -d "$2" ] || die 'tmpdir "%s" is not a directory' "$2"
-            tmpdir=$2
-            shift 2
-            ;;
-        '-v') verbose=1; shift;;
-        '--') shift; break;;
+        -v|--verbose) verbose=-v; shift;;
+        --) shift; break;;
         *) die "getopt failure"
     esac
 done
 
-case "$#" in
-    1) lowerdir=$1 dir=${1##*:};;
-    2) lowerdir=$1 dir=$2;;
-    *) usage >&2; exit 1;;
-esac
+[ $# != 0 ] || { log 'no paths specified'; usage >&2; exit 1; }
 
-ld=
-set -f
-savedIFS=$IFS IFS=:
-for d in $lowerdir; do
-    d=$(realpath -e "$d")
-    [ -d "$d" ] || die 'lowerdir "%s" is not a directory' "$d"
-    ld=$ld:$d
+unset lowerdir
+while [ -n "$2" ]; do
+    d=$(canon "$1")
+    if [ -h "$d" ] || ! [ -d "$d" ]; then
+        die 'source "%s" is not a directory' "$d"
+    fi
+    lowerdir=${lowerdir+:}$d
+    shift
 done
-IFS=$savedIFS
-set +f
-ld=${ld#:}
-[ -d "$dir" ] || die 'destination "%s" is not a directory' "$dir"
+
+dest=$(canon "$1")
+echo lowerdir=$lowerdir dest=$dest
+[ -d "$dest" ] || die 'destination "%s" is not a directory' "$dest"
+[ "$dest" != / ] || log 'overmounting root, use with caution'
+
+if [ -z "$lowerdir" ]; then
+    lowerdir=$dest
+fi
 
 err() {
-    if [ -n "$mounted_tmpdir" ]; then
-        umount "$tmpdir" || exit 1
+    r=$?
+    trap - INT TERM QUIT
+    logv 'an error occurred, cleaning up'
+    if [ -d "$tmpdir" ]; then
+        if mountpoint -q "$tmpdir"; then
+            logv 'unmounting tmpdir'
+            umount $no_mtab "$tmpdir"
+        fi
+        logv 'deleting tmpdir'
+        rmdir "$tmpdir"
     fi
-    if [ -n "$tmpdir" ] && [ -n "$created_tmpdir" ]; then
-        rm -r "$tmpdir"
+    case $1 in
+        [A-Z]*) logv 'reraising SIG%s' $1; kill -$1 $$ && read _
+    esac
+    logv 'exiting'
+    if [ $r = 0 ]; then
+        exit 1
     fi
-    exit 1
+    exit $r
 }
 
+trap 'err INT' INT
+trap 'err TERM' TERM
+trap 'err QUIT' QUIT
+
 if [ -z "$tmpdir" ]; then
-    tmpdir=$(umask 077; mktemp -d --tmpdir tmpoverlay.XXXXXXXXXX) || exit 1
-    created_tmpdir=1
-    verb 'created tmpdir: %s' "$tmpdir"
+    logv 'creating tmpdir'
+    tmpdir=$(umask 077; mktemp -dt tmpoverlay.XXXXXXXXXX) || exit 1
+    logv 'created tmpdir: %s' "$tmpdir"
 fi
 mount -t tmpfs ${tmpfs_opts:+-o "$tmpfs_opts"} ${verbose:+-v} tmpfs "$tmpdir" || err
-mounted_tmpdir=1
+
 upperdir="$tmpdir/upper"
 workdir="$tmpdir/work"
+logv 'creating upper/work dirs'
 mkdir "$upperdir" "$workdir" || err
-chown --reference="${ld##*:}" "$upperdir" "$workdir"
-chmod --reference="${ld##*:}" "$upperdir" "$workdir"
 
-overlayfs_opts="lowerdir=$ld,upperdir=$upperdir,workdir=$workdir$extra_overlayfs_opts"
-mount -t overlay -o "$overlayfs_opts" ${no_mtab:+-n} ${verbose:+-v} overlay "$dir" || err
+# try to match perms/attrs. this is not race-free but it's impossible without
+# atomic (CAS) chown/chmod/setfattr. chown --from is not atomic, not portable,
+# and also doesn't cover chmod/setfattr.
+lastlowerdir=${lowerdir##*:}
+logv 'copying lowerdir owner to upperdir'
+owner=$(stat -c %u:%g "$lastlowerdir") || err
+chown $owner "$upperdir" || err
+logv 'copying lowerdir perms to upperdir'
+mode=$(stat -c %a "$lastlowerdir") || err
+chmod $mode "$upperdir" || err
+# -m - covers ACLs (system.posix_acl_access) and file caps
+# (security.capability). theoretically someone might have get/setcap and/or
+# get/setfacl but not get/setxattr, but this is unlikely since libcap/acl
+# require attr.
+logv 'copying root attrs'
+if attr=$(cd "$lastlowerdir" && getfattr -d -m - . 2>/dev/null); then
+    if [ -n "$attr" ]; then
+        printf '%s\n' "$attr" | (cd "$upperdir"; setfattr --restore=-) || err
+    fi
+else
+    log 'getfattr not found or failed, skipping xattrs'
+fi
 
-umount "$tmpdir" || err
-rm -r "$tmpdir" || err
+logv 'mounting overlay'
+overlayfs_opts="lowerdir=$lowerdir,upperdir=$upperdir,workdir=$workdir,volatile$extra_overlayfs_opts"
+mount -t overlay -o "$overlayfs_opts" $no_canon $no_mtab $verbose ${mount_name-overlay} "$dest" || err
+
+logv 'cleaning up'
+umount "$tmpdir" || exit
+rmdir "$tmpdir" || exit
+
+logv 'done, exiting'
