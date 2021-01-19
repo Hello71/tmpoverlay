@@ -2,7 +2,9 @@ tmpoverlay
 ==========
 
 tmpoverlay is a small, almost-POSIX shell script to create tmpfs-backed
-overlayfs mounts. See tmpoverlay --help for usage information.
+overlayfs mounts. tmpoverlay automatically detects and uses index=on and
+volatile, as well as redirect_dir and metacopy if only a single lowerdir is
+used. See tmpoverlay --help for usage information.
 
 One important thing to note is that like any other Linux mount, an overlayfs
 mount only affects new directory lookups. If a process has its current
@@ -21,9 +23,9 @@ POSIX compliance
 With the following exceptions, tmpoverlay is intended to be functional on
 POSIX-only shells:
 
-- ``getopt --`` is required for proper handling of options containing spaces
 - ``mount -t overlay`` is obviously required
+- ``getopt --`` is required for proper handling of options containing spaces
+- ``stat -c`` is required to obtain upperdir owner and permissions, because
+  parsing ls -l is ridiculous.
 - ``getfattr`` is used for xattr copying but in case of failure, the system is
   assumed to not support xattrs and setfattr is skipped.
-- ``stat -c`` is used to obtain upperdir owner and permissions, because parsing
-  ls -l is nonsense.

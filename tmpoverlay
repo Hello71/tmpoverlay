@@ -36,8 +36,32 @@ logv() {
 }
 
 die() {
-    log "$@"
-    exit 1
+    r=$?
+    trap - INT TERM QUIT
+    unset sig
+    case $1 in
+        -[A-Z]*) sig=${1#-};;
+        '') ;;
+        *) log "$@"
+    esac
+    logv 'an error occurred, cleaning up'
+    if [ -d "$tmpdir" ] && [ -n "$own_tmpdir" ]; then
+        if mountpoint -q "$tmpdir"; then
+            logv 'unmounting tmpdir'
+            umount $no_mtab "$tmpdir"
+        fi
+        logv 'deleting tmpdir'
+        rmdir "$tmpdir"
+    fi
+    if [ -n "$sig" ]; then
+        logv 'reraising SIG%s' $1
+        kill -$1 $$ && read _
+    fi
+    logv 'exiting'
+    if [ $r = 0 ]; then
+        exit 1
+    fi
+    exit $r
 }
 
 canon() {
@@ -63,17 +87,19 @@ my_getopt() {
         "$@"
 }
 
+unset own_tmpdir
+
 args=$(my_getopt "$@") || { usage >&2; exit 1; }
 eval set -- "$args"
 unset args
 
-unset no_canon no_mtab extra_overlayfs_opts tmpfs_opts tmpdir verbose
+unset no_canon extra_ovl_opts no_mtab mount_name tmpfs_opts verbose
 while true; do
     case "$1" in
         -c|--no-canonicalize) no_canon=-c; shift;;
         -h|--help) usage; exit 0;;
         -o|--overlayfs)
-            [ -n "$2" ] && extra_overlayfs_opts="$extra_overlayfs_opts,$2"
+            [ -n "$2" ] && extra_ovl_opts="$extra_ovl_opts,$2"
             shift 2
             ;;
         -n|--no-mtab) no_mtab=-n; shift;;
@@ -101,7 +127,6 @@ while [ -n "$2" ]; do
 done
 
 dest=$(canon "$1")
-echo lowerdir=$lowerdir dest=$dest
 [ -d "$dest" ] || die 'destination "%s" is not a directory' "$dest"
 [ "$dest" != / ] || log 'overmounting root, use with caution'
 
@@ -109,54 +134,64 @@ if [ -z "$lowerdir" ]; then
     lowerdir=$dest
 fi
 
-err() {
-    r=$?
-    trap - INT TERM QUIT
-    logv 'an error occurred, cleaning up'
-    if [ -d "$tmpdir" ]; then
-        if mountpoint -q "$tmpdir"; then
-            logv 'unmounting tmpdir'
-            umount $no_mtab "$tmpdir"
-        fi
-        logv 'deleting tmpdir'
-        rmdir "$tmpdir"
-    fi
-    case $1 in
-        [A-Z]*) logv 'reraising SIG%s' $1; kill -$1 $$ && read _
-    esac
-    logv 'exiting'
-    if [ $r = 0 ]; then
-        exit 1
-    fi
-    exit $r
-}
-
-trap 'err INT' INT
-trap 'err TERM' TERM
-trap 'err QUIT' QUIT
+trap 'die -INT' INT
+trap 'die -TERM' TERM
+trap 'die -QUIT' QUIT
 
 if [ -z "$tmpdir" ]; then
     logv 'creating tmpdir'
+    own_tmpdir=1
     tmpdir=$(umask 077; mktemp -dt tmpoverlay.XXXXXXXXXX) || exit 1
     logv 'created tmpdir: %s' "$tmpdir"
 fi
-mount -t tmpfs ${tmpfs_opts:+-o "$tmpfs_opts"} ${verbose:+-v} tmpfs "$tmpdir" || err
+mount -t tmpfs ${tmpfs_opts:+-o "$tmpfs_opts"} ${verbose:+-v} tmpfs "$tmpdir" || die
 
 upperdir="$tmpdir/upper"
 workdir="$tmpdir/work"
-logv 'creating upper/work dirs'
-mkdir "$upperdir" "$workdir" || err
+testdir="$tmpdir/test"
+tmpmnt="$tmpdir/tmpmnt"
+logv 'creating dirs'
+mkdir "$upperdir" "$workdir" "$testdir" "$tmpmnt" || die
+
+our_ovl_opts=
+test_ovl_opts="lowerdir=$testdir,upperdir=$upperdir,workdir=$workdir"
+logv 'testing overlay options'
+mount -n -t overlay -o "$test_ovl_opts" overlay "$tmpmnt" || die "overlayfs is not supported"
+umount "$tmpmnt"
+if [ -n "$extra_ovl_opts" ]; then
+    mount -n -t overlay -o "$test_ovl_opts$extra_ovl_opts" overlay "$tmpmnt" || die "invalid extra overlayfs options"
+    umount "$tmpmnt"
+fi
+try_ovl_opt() {
+    case ",$extra_ovl_opts," in
+        *",$1[=,]"*) return
+    esac
+    logv 'checking if %s is supported' "$1${2+=$2}"
+    ovl_opts="$test_ovl_opts,$1${2+=$2}$extra_ovl_opts"
+    mount -n -t overlay -o "$ovl_opts" "overlay" "$tmpmnt" 2>/dev/null || return
+    umount "$tmpmnt" || die
+    rm -r "$workdir" "$upperdir" || die
+    mkdir "$upperdir" "$workdir" || die
+    our_ovl_opts="$our_ovl_opts,$1${2+=$2}"
+}
+case $lowerdir in
+    *:*) ;;
+    *) try_ovl_opt redirect_dir on
+       try_ovl_opt metacopy on
+esac
+try_ovl_opt index on
+try_ovl_opt volatile
 
 # try to match perms/attrs. this is not race-free but it's impossible without
 # atomic (CAS) chown/chmod/setfattr. chown --from is not atomic, not portable,
 # and also doesn't cover chmod/setfattr.
 lastlowerdir=${lowerdir##*:}
 logv 'copying lowerdir owner to upperdir'
-owner=$(stat -c %u:%g "$lastlowerdir") || err
-chown $owner "$upperdir" || err
+owner=$(stat -c %u:%g "$lastlowerdir") || die
+chown $owner "$upperdir" || die
 logv 'copying lowerdir perms to upperdir'
-mode=$(stat -c %a "$lastlowerdir") || err
-chmod $mode "$upperdir" || err
+mode=$(stat -c %a "$lastlowerdir") || die
+chmod $mode "$upperdir" || die
 # -m - covers ACLs (system.posix_acl_access) and file caps
 # (security.capability). theoretically someone might have get/setcap and/or
 # get/setfacl but not get/setxattr, but this is unlikely since libcap/acl
@@ -164,15 +199,16 @@ chmod $mode "$upperdir" || err
 logv 'copying root attrs'
 if attr=$(cd "$lastlowerdir" && getfattr -d -m - . 2>/dev/null); then
     if [ -n "$attr" ]; then
-        printf '%s\n' "$attr" | (cd "$upperdir"; setfattr --restore=-) || err
+        printf '%s\n' "$attr" | (cd "$upperdir"; setfattr --restore=-) || die
     fi
 else
     log 'getfattr not found or failed, skipping xattrs'
 fi
 
 logv 'mounting overlay'
-overlayfs_opts="lowerdir=$lowerdir,upperdir=$upperdir,workdir=$workdir,volatile$extra_overlayfs_opts"
-mount -t overlay -o "$overlayfs_opts" $no_canon $no_mtab $verbose ${mount_name-overlay} "$dest" || err
+mount_opts="$no_canon $no_mtab $verbose"
+ovl_opts="lowerdir=$lowerdir,upperdir=$upperdir,workdir=$workdir$our_ovl_opts$extra_ovl_opts"
+mount $mount_opts -t overlay -o "$ovl_opts" "${mount_name-overlay}" "$dest" || die
 
 logv 'cleaning up'
 umount "$tmpdir" || exit
