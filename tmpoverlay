@@ -20,13 +20,17 @@ examples:
   tmpoverlay / /new_root       # make a thin copy of root
   tmpoverlay /etc              # make read-only /etc writable
   tmpoverlay /a /b /c /merged  # merge /a, /b, /c, and a fresh tmpfs
+  tmpoverlay /                 # USE WITH CAUTION, see docs
 EOF
 }
 
 log() {
     fmt=$1
     shift
-    printf "tmpoverlay: $fmt\n" "$@" >&2
+    printf 'tmpoverlay: ' >&2
+    # shellcheck disable=SC2059
+    printf "$fmt" "$@" >&2
+    printf '\n' >&2
 }
 
 logv() {
@@ -35,6 +39,12 @@ logv() {
     fi
 }
 
+cmdv() {
+    logv '%s ' "$@"
+    "$@"
+}
+
+unset own_tmpdir
 die() {
     r=$?
     trap - INT TERM QUIT
@@ -48,14 +58,15 @@ die() {
     if [ -d "$tmpdir" ] && [ -n "$own_tmpdir" ]; then
         if mountpoint -q "$tmpdir"; then
             logv 'unmounting tmpdir'
+            # shellcheck disable=SC2086
             umount $no_mtab "$tmpdir"
         fi
         logv 'deleting tmpdir'
         rmdir "$tmpdir"
     fi
     if [ -n "$sig" ]; then
-        logv 'reraising SIG%s' $1
-        kill -$1 $$ && read _
+        logv 'reraising SIG%s' "$1"
+        kill "-$1" "$$" && read -r _
     fi
     logv 'exiting'
     if [ $r = 0 ]; then
@@ -86,8 +97,6 @@ my_getopt() {
         cho:nN:t:v \
         "$@"
 }
-
-unset own_tmpdir
 
 args=$(my_getopt "$@") || { usage >&2; exit 1; }
 eval set -- "$args"
@@ -148,38 +157,56 @@ mount -t tmpfs ${tmpfs_opts:+-o "$tmpfs_opts"} ${verbose:+-v} tmpfs "$tmpdir" ||
 
 upperdir="$tmpdir/upper"
 workdir="$tmpdir/work"
-testdir="$tmpdir/test"
 tmpmnt="$tmpdir/tmpmnt"
 logv 'creating dirs'
-mkdir "$upperdir" "$workdir" "$testdir" "$tmpmnt" || die
+mkdir "$upperdir" "$workdir" "$tmpmnt" || die
 
-our_ovl_opts=
-test_ovl_opts="lowerdir=$testdir,upperdir=$upperdir,workdir=$workdir"
+ovl_opts="lowerdir=$lowerdir,upperdir=$upperdir,workdir=$workdir"
 logv 'testing overlay options'
-mount -n -t overlay -o "$test_ovl_opts" overlay "$tmpmnt" || die "overlayfs is not supported"
+mount -n -t overlay -o "$ovl_opts" overlay "$tmpmnt" || die "overlayfs is not supported"
 umount "$tmpmnt"
 if [ -n "$extra_ovl_opts" ]; then
-    mount -n -t overlay -o "$test_ovl_opts$extra_ovl_opts" overlay "$tmpmnt" || die "invalid extra overlayfs options"
+    ovl_opts="$ovl_opts,$extra_ovl_opts"
+    mount -n -t overlay -o "$ovl_opts" overlay "$tmpmnt" || die "invalid extra overlayfs options"
     umount "$tmpmnt"
 fi
+chk_ovl_opt() {
+    if [ -n "$2" ]; then
+        case ",$ovl_opts," in
+            *",$1=$2,"*) return 0
+        esac
+        [ "$2" = on ] && val=Y || val=N
+    else
+        val=Y
+    fi
+    f=/sys/module/overlay/parameters/$1
+    [ -e "$f" ] && [ "$(cat "$f")" = "$val" ]
+}
 try_ovl_opt() {
-    case ",$extra_ovl_opts," in
-        *",$1[=,]"*) return
+    # returns 0 iff option is/gets enabled
+    case ",$ovl_opts," in
+        *",$1=off,"*) return 1;;
+        *",$1[=,]"*) return 0
     esac
-    logv 'checking if %s is supported' "$1${2+=$2}"
-    ovl_opts="$test_ovl_opts,$1${2+=$2}$extra_ovl_opts"
-    mount -n -t overlay -o "$ovl_opts" "overlay" "$tmpmnt" 2>/dev/null || return
+    if chk_ovl_opt "$1"; then
+        logv 'skipping %s'
+        return
+    fi
+    logv 'trying %s' "$1${2+=$2}"
+    new_ovl_opts="$ovl_opts,$1${2+=$2}"
+    mount -n -t overlay -o "$new_ovl_opts" "overlay" "$tmpmnt" 2>/dev/null || return
     umount "$tmpmnt" || die
+    # clear out workdir/work/incompat/volatile and upperdir index
     rm -r "$workdir" "$upperdir" || die
     mkdir "$upperdir" "$workdir" || die
-    our_ovl_opts="$our_ovl_opts,$1${2+=$2}"
+    ovl_opts="$new_ovl_opts"
 }
-case $lowerdir in
-    *:*) ;;
-    *) try_ovl_opt redirect_dir on
-       try_ovl_opt metacopy on
-esac
 try_ovl_opt index on
+# redirect_dir/metacopy are unsafe with untrusted non-bottom layers
+[ "${lowerdir#*:}" = "$lowerdir" ] && \
+    ! chk_ovl_opt userxattr on && \
+    try_ovl_opt redirect_dir on && \
+    { chk_ovl_opt nfs_export on || try_ovl_opt metacopy on; }
 try_ovl_opt volatile
 
 # try to match perms/attrs. this is not race-free but it's impossible without
@@ -188,18 +215,18 @@ try_ovl_opt volatile
 lastlowerdir=${lowerdir##*:}
 logv 'copying lowerdir owner to upperdir'
 owner=$(stat -c %u:%g "$lastlowerdir") || die
-chown $owner "$upperdir" || die
+chown "$owner" "$upperdir" || die
 logv 'copying lowerdir perms to upperdir'
 mode=$(stat -c %a "$lastlowerdir") || die
-chmod $mode "$upperdir" || die
+chmod "$mode" "$upperdir" || die
 # -m - covers ACLs (system.posix_acl_access) and file caps
 # (security.capability). theoretically someone might have get/setcap and/or
 # get/setfacl but not get/setxattr, but this is unlikely since libcap/acl
 # require attr.
-logv 'copying root attrs'
-if attr=$(cd "$lastlowerdir" && getfattr -d -m - . 2>/dev/null); then
-    if [ -n "$attr" ]; then
-        printf '%s\n' "$attr" | (cd "$upperdir"; setfattr --restore=-) || die
+logv 'copying root xattrs'
+if attrs=$(cd "$lastlowerdir" && getfattr -d -m - . 2>/dev/null); then
+    if [ -n "$attrs" ]; then
+        printf '%s\n' "$attrs" | (cd "$upperdir"; setfattr --restore=-) || die
     fi
 else
     log 'getfattr not found or failed, skipping xattrs'
@@ -207,11 +234,11 @@ fi
 
 logv 'mounting overlay'
 mount_opts="$no_canon $no_mtab $verbose"
-ovl_opts="lowerdir=$lowerdir,upperdir=$upperdir,workdir=$workdir$our_ovl_opts$extra_ovl_opts"
-mount $mount_opts -t overlay -o "$ovl_opts" "${mount_name-overlay}" "$dest" || die
+# shellcheck disable=SC2086
+cmdv mount $mount_opts -t overlay -o "$ovl_opts" "${mount_name-overlay}" "$dest" || die
 
 logv 'cleaning up'
 umount "$tmpdir" || exit
 rmdir "$tmpdir" || exit
 
-logv 'done, exiting'
+logv 'done'
