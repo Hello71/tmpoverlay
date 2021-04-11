@@ -202,23 +202,31 @@ try_ovl_opt() {
     ovl_opts="$new_ovl_opts"
 }
 try_ovl_opt index on
-# redirect_dir/metacopy are unsafe with untrusted non-bottom layers
+# redirect_dir and metacopy are unsafe with untrusted non-bottom layers
+# nfs_export conflicts with metacopy
 [ "${lowerdir#*:}" = "$lowerdir" ] && \
     ! chk_ovl_opt userxattr on && \
     try_ovl_opt redirect_dir on && \
     { chk_ovl_opt nfs_export on || try_ovl_opt metacopy on; }
 try_ovl_opt volatile
 
-# try to match perms/attrs. this is not race-free but it's impossible without
-# atomic (CAS) chown/chmod/setfattr. chown --from is not atomic, not portable,
-# and also doesn't cover chmod/setfattr.
+logv 'copying lowerdir owner/perms to upperdir'
 lastlowerdir=${lowerdir##*:}
-logv 'copying lowerdir owner to upperdir'
-owner=$(stat -c %u:%g "$lastlowerdir") || die
-chown "$owner" "$upperdir" || die
-logv 'copying lowerdir perms to upperdir'
-mode=$(stat -c %a "$lastlowerdir") || die
-chmod "$mode" "$upperdir" || die
+# stat -c isn't posix -.-
+ls=$(ls -dn "$lastlowerdir/.") || die
+tmp=${ls#* * }
+owner=${tmp%% *}
+tmp=${tmp#* }
+group=${tmp%% *}
+chown "$owner:$group" "$upperdir" || die
+mode=${ls%% *}
+[ "${#mode}" = 10 ] || die "bad ls permission format"
+mode=${mode#?}
+umode=${mode%??????}
+ugmode=${mode%???}
+gmode=${ugmode#???}
+omode=${mode#??????}
+chmod "u=$umode,g=$gmode,o=$omode" "$upperdir" || die
 # -m - covers ACLs (system.posix_acl_access) and file caps
 # (security.capability). theoretically someone might have get/setcap and/or
 # get/setfacl but not get/setxattr, but this is unlikely since libcap/acl
@@ -229,7 +237,7 @@ if attrs=$(cd "$lastlowerdir" && getfattr -d -m - . 2>/dev/null); then
         printf '%s\n' "$attrs" | (cd "$upperdir"; setfattr --restore=-) || die
     fi
 else
-    log 'getfattr not found or failed, skipping xattrs'
+    log 'getfattr failed, skipping xattrs'
 fi
 
 logv 'mounting overlay'

@@ -7,7 +7,7 @@ overlayfs mounts.
 Features
 --------
 
-- minimal requirements (sh, mount, getopt, stat)
+- minimal requirements (sh, mount, getopt)
 
 Benefits over manually calling ``mkdir /tmp/x; mount ...``
 
@@ -39,7 +39,5 @@ POSIX-only shells:
 
 - ``mount -t overlay`` is obviously required
 - ``getopt --`` is required for proper handling of options containing spaces
-- ``stat -c`` is required to obtain upperdir owner and permissions, because
-  parsing ls -l is ridiculous.
 - ``getfattr`` is used for xattr copying but in case of failure, the system is
   assumed to not support xattrs and setfattr is skipped.
