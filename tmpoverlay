@@ -13,6 +13,7 @@ options:
   -o, --overlayfs OPTS   add overlayfs mount options, e.g. redirect_dir/metacopy
   -n, --no-mtab          don't write to /etc/mtab
   -N, --mount-name NAME  source name for mount (default "overlay")
+  -r, --recursive        overlay every mount in DEST (-rr for separate tmpfs)
   -t, --tmpfs OPTS       add tmpfs mount options, e.g. size
   -v, --verbose          verbose mode
 
@@ -59,7 +60,7 @@ die() {
         if mountpoint -q "$tmpdir"; then
             logv 'unmounting tmpdir'
             # shellcheck disable=SC2086
-            umount $no_mtab "$tmpdir"
+            umount -R $no_mtab "$tmpdir"
         fi
         logv 'deleting tmpdir'
         rmdir "$tmpdir"
@@ -90,11 +91,12 @@ my_getopt() {
         -l overlayfs: \
         -l no-mtab \
         -l mount-name: \
+        -l recursive \
         -l tmpfs: \
         -l verbose \
         -n tmpoverlay \
         -- \
-        cho:nN:t:v \
+        cho:nN:rt:v \
         "$@"
 }
 
@@ -103,6 +105,7 @@ eval set -- "$args"
 unset args
 
 unset no_canon extra_ovl_opts no_mtab mount_name tmpfs_opts verbose
+recursive=0
 while true; do
     case "$1" in
         -c|--no-canonicalize) no_canon=-c; shift;;
@@ -113,6 +116,9 @@ while true; do
             ;;
         -n|--no-mtab) no_mtab=-n; shift;;
         -N|--mount-name) mount_name=$2; shift 2;;
+        -r|--recursive)
+            recursive=$((recursive + 1))
+            ;;
         -t|--tmpfs)
             [ -n "$2" ] && tmpfs_opts="${tmpfs_opts:+$tmpfs_opts,}$2"
             shift 2
@@ -210,6 +216,28 @@ try_ovl_opt index on
     { chk_ovl_opt nfs_export on || try_ovl_opt metacopy on; }
 try_ovl_opt volatile
 
+if [ "$recursive" != 0 ]; then
+    set -- "$lowerdir"
+    while read -r src tgt rest; do
+        case $lowerdir/ in
+            # if lowerdir is in tgt, restart
+            "$tgt"/*) exec 3>"$tmpdir/mounts"
+        esac
+        case $tgt/ in
+            # if tgt is in lowerdir, add to dirs
+            "$lowerdir"/*) printf "%s %s %s\n" "$src" "$tgt" "$rest" >&3
+        esac
+    done < /proc/self/mounts 3>"$tmpdir/mounts"
+    while read -r src tgt fstype rest; do
+        case $fstype in
+            autofs|binfmt_misc|cgroup|cgroup2|configfs|debugfs|devpts|efivarfs|fusectl|hugetlbfs|mqueue|proc|sysfs|zonefs)
+                mount --bind "$tgt" "$dest/${tgt#"$lowerdir"}" || die
+                ;;
+            *)
+                do_tmpoverlay "$tgt" "$dest/${tgt#"$lowerdir"}"
+        esac
+    done <"$tmpdir/mounts"
+fi
 logv 'copying lowerdir owner/perms to upperdir'
 lastlowerdir=${lowerdir##*:}
 # stat -c isn't posix -.-
@@ -231,7 +259,7 @@ chmod "u=$umode,g=$gmode,o=$omode" "$upperdir" || die
 # (security.capability). theoretically someone might have get/setcap and/or
 # get/setfacl but not get/setxattr, but this is unlikely since libcap/acl
 # require attr.
-logv 'copying root xattrs'
+logv 'copying xattrs'
 if attrs=$(cd "$lastlowerdir" && getfattr -d -m - . 2>/dev/null); then
     if [ -n "$attrs" ]; then
         printf '%s\n' "$attrs" | (cd "$upperdir"; setfattr --restore=-) || die
