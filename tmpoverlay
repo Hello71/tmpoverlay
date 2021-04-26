@@ -126,7 +126,7 @@ done
 [ $# != 0 ] || { log 'no paths specified'; usage >&2; exit 1; }
 
 unset lowerdir
-while [ -n "$2" ]; do
+while [ "$#" != 1 ]; do
     d=$(canon "$1")
     if [ -h "$d" ] || ! [ -d "$d" ]; then
         die 'source "%s" is not a directory' "$d"
