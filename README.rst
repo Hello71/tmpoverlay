@@ -41,3 +41,4 @@ POSIX-only shells:
 - ``getopt --`` is required for proper handling of options containing spaces
 - ``getfattr`` is used for xattr copying but in case of failure, the system is
   assumed to not support xattrs and setfattr is skipped.
+- ``realpath`` is required for canonicalizing paths if -c is not provided
