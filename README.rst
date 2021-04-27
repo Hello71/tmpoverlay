@@ -35,7 +35,12 @@ Changes to underlying filesystems
 ---------------------------------
 
 Per `the kernel overlayfs documentation`_, changing underlying filesystems
-while the overlay is mounted is not supported.
+while the overlay is mounted is not supported:
+
+    Changes to the underlying filesystems while part of a mounted overlay
+    filesystem are not allowed. If the underlying filesystem is changed, the
+    behavior of the overlay is undefined, though it will not result in a crash
+    or deadlock.
 
 .. _the kernel overlayfs documentation: https://www.kernel.org/doc/html/latest/filesystems/overlayfs.html#changes-to-underlying-filesystems
 
