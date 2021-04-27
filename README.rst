@@ -17,8 +17,8 @@ Benefits over manually calling ``mkdir /tmp/x; mount ...``
 - synchronizes owner, permissions, and xattrs (including lowerdir ACL)
 - autodetects optimization flags (redirect_dir, metacopy, index, volatile)
 
-Overmounting notes
-------------------
+Overmounting
+------------
 
 Like any other Linux mount, an overlayfs mount only affects new directory
 lookups. If a process has its current directory or has files open inside the
@@ -30,6 +30,21 @@ tmpoverlay to overmount ``/``.
 
 .. _pivot_root(2): https://man7.org/linux/man-pages/man2/pivot_root.2.html
 .. _pivot_root(8): https://man7.org/linux/man-pages/man8/pivot_root.8.html
+
+Changes to underlying filesystems
+---------------------------------
+
+Per `the kernel overlayfs documentation`_, changing underlying filesystems
+while the overlay is mounted is not supported.
+
+.. _the kernel overlayfs documentation: https://www.kernel.org/doc/html/latest/filesystems/overlayfs.html#changes-to-underlying-filesystems
+
+Pseudo-filesystems
+------------------
+
+Pseudo-filesystems like procfs and sysfs are not intended to be used with
+overlayfs. Therefore, running commands like ``tmpoverlay /proc`` may have
+unexpected results.
 
 POSIX compliance
 ----------------
