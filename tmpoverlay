@@ -1,6 +1,7 @@
 #!/bin/sh
 
 usage() {
+    [ "$1" = 0 ] || exec >&2
     cat << EOF
 usage: tmpoverlay [OPTIONS] [SOURCE...] DEST
 
@@ -22,21 +23,26 @@ examples:
   tmpoverlay /a /b /c /merged  # merge /a, /b, /c, and a fresh tmpfs
   tmpoverlay /                 # USE WITH CAUTION, see docs
 EOF
+    exit "$1"
 }
 
 log() {
-    fmt=$1
-    shift
-    printf 'tmpoverlay: ' >&2
-    # shellcheck disable=SC2059
-    printf "$fmt" "$@" >&2
+    logn "$@"
     printf '\n' >&2
 }
 
+logn() {
+    # not equivalent to printf "tmpoverlay: $@"
+    printf 'tmpoverlay: ' >&2
+    printf "$@" >&2
+}
+
 logv() {
-    if [ -n "$verbose" ]; then
-        log "$@"
-    fi
+    [ -z "$verbose" ] || log "$@"
+}
+
+logvn() {
+    [ -z "$verbose" ] || logn "$@"
 }
 
 cmdv() {
@@ -44,34 +50,12 @@ cmdv() {
     "$@"
 }
 
-unset own_tmpdir
+unset tmpdir
 die() {
     r=$?
-    trap - INT TERM QUIT
-    unset sig
-    case $1 in
-        -[A-Z]*) sig=${1#-};;
-        '') ;;
-        *) log "$@"
-    esac
-    logv 'an error occurred, cleaning up'
-    if [ -d "$tmpdir" ] && [ -n "$own_tmpdir" ]; then
-        if mountpoint -q "$tmpdir"; then
-            logv 'unmounting tmpdir'
-            # shellcheck disable=SC2086
-            umount $no_mtab "$tmpdir"
-        fi
-        logv 'deleting tmpdir'
-        rmdir "$tmpdir"
-    fi
-    if [ -n "$sig" ]; then
-        logv 'reraising SIG%s' "$1"
-        kill "-$1" "$$" && read -r _
-    fi
-    logv 'exiting'
-    if [ $r = 0 ]; then
-        exit 1
-    fi
+    [ "$r" != 0 ] || r=1
+    [ "$#" = 0 ] || log "$@"
+    [ -z "$tmpdir" ] || { exec 9>&-; wait; }
     exit $r
 }
 
@@ -98,7 +82,7 @@ my_getopt() {
         "$@"
 }
 
-args=$(my_getopt "$@") || { usage >&2; exit 1; }
+args=$(my_getopt "$@") || usage 1
 eval set -- "$args"
 unset args
 
@@ -106,7 +90,7 @@ unset no_canon extra_ovl_opts no_mtab mount_name tmpfs_opts verbose
 while true; do
     case "$1" in
         -c|--no-canonicalize) no_canon=-c; shift;;
-        -h|--help) usage; exit 0;;
+        -h|--help) usage 0;;
         -o|--overlayfs)
             [ -n "$2" ] && extra_ovl_opts="$extra_ovl_opts,$2"
             shift 2
@@ -123,7 +107,7 @@ while true; do
     esac
 done
 
-[ $# != 0 ] || { log 'no paths specified'; usage >&2; exit 1; }
+[ $# != 0 ] || usage 1
 
 unset lowerdir
 while [ "$#" != 1 ]; do
@@ -139,21 +123,34 @@ dest=$(canon "$1")
 [ -d "$dest" ] || die 'destination "%s" is not a directory' "$dest"
 [ "$dest" != / ] || log 'overmounting root, use with caution'
 
-if [ -z "$lowerdir" ]; then
-    lowerdir=$dest
-fi
+[ -n "$lowerdir" ] || lowerdir=$dest
 
-trap 'die -INT' INT
-trap 'die -TERM' TERM
-trap 'die -QUIT' QUIT
-
-if [ -z "$tmpdir" ]; then
-    logv 'creating tmpdir'
-    own_tmpdir=1
-    tmpdir=$(umask 077; mktemp -dt tmpoverlay.XXXXXXXXXX) || exit 1
-    logv 'created tmpdir: %s' "$tmpdir"
-fi
-mount -t tmpfs ${tmpfs_opts:+-o "$tmpfs_opts"} ${verbose:+-v} tmpfs "$tmpdir" || die
+logv 'creating tmpdir'
+tmpdir=$(umask 077; mktemp -dt tmpoverlay.XXXXXXXXXX) || die
+logv 'created tmpdir: %s' "$tmpdir"
+case "$tmpdir" in
+    "$dest"/*) log "warning: tmpdir cannot be cleaned up after overmounting $dest"
+esac
+mount -t tmpfs ${tmpfs_opts:+-o "$tmpfs_opts"} $verbose tmpfs "$tmpdir" || { rmdir "$tmpdir"; die; }
+mkfifo "$tmpdir/fifo" || { umount "$tmpdir"; rmdir "$tmpdir"; die; }
+# subshell allows cleanup after overmount /tmp without using realpath source
+# subshell also avoids trapping signals which is annoying in shell
+(
+    cd "$tmpdir" || die
+    exec <fifo || die
+    # read returns non-zero when write end is closed
+    read _
+    logv 'unmounting tmpdir'
+    # TODO: this *almost* works except umount insists on canonicalizing .
+    # shellcheck disable=SC2086
+    umount -cil $no_mtab . || die
+    logv 'deleting tmpdir'
+    cd /
+    rmdir "$tmpdir" || die
+) &
+# should be FD_CLOEXEC but can't do in shell
+exec 9>"$tmpdir/fifo"
+# starting from here, exiting will cause cleanup
 
 upperdir="$tmpdir/upper"
 workdir="$tmpdir/work"
@@ -168,7 +165,7 @@ umount "$tmpmnt"
 if [ -n "$extra_ovl_opts" ]; then
     ovl_opts="$ovl_opts,$extra_ovl_opts"
     mount -n -t overlay -o "$ovl_opts" overlay "$tmpmnt" || die "invalid extra overlayfs options"
-    umount "$tmpmnt"
+    umount "$tmpmnt" || die
 fi
 chk_ovl_opt() {
     if [ -n "$2" ]; then
@@ -189,12 +186,16 @@ try_ovl_opt() {
         *",$1[=,]"*) return 0
     esac
     if chk_ovl_opt "$1"; then
-        logv 'skipping %s'
+        logv 'not checking %s'
         return
     fi
-    logv 'trying %s' "$1${2+=$2}"
+    logvn 'trying %s... ' "$1${2+=$2}"
     new_ovl_opts="$ovl_opts,$1${2+=$2}"
-    mount -n -t overlay -o "$new_ovl_opts" "overlay" "$tmpmnt" 2>/dev/null || return
+    if ! cmdv mount -n -t overlay -o "$new_ovl_opts" "overlay" "$tmpmnt" 2>/dev/null; then
+        [ -z "$verbose" ] || echo rejected >&2
+        return
+    fi
+    [ -z "$verbose" ] || echo ok >&2
     umount "$tmpmnt" || die
     # clear out workdir/work/incompat/volatile and upperdir index
     rm -r "$workdir" "$upperdir" || die
@@ -212,21 +213,15 @@ try_ovl_opt volatile
 
 logv 'copying lowerdir owner/perms to upperdir'
 lastlowerdir=${lowerdir##*:}
-# stat -c isn't posix -.-
+# stat -c isn't posix, but ls is
 ls=$(ls -dn "$lastlowerdir/.") || die
-tmp=${ls#* * }
-owner=${tmp%% *}
-tmp=${tmp#* }
-group=${tmp%% *}
-chown "$owner:$group" "$upperdir" || die
-mode=${ls%% *}
-[ "${#mode}" = 10 ] || die "bad ls permission format"
-mode=${mode#?}
-umode=${mode%??????}
-ugmode=${mode%???}
-gmode=${ugmode#???}
-omode=${mode#??????}
-chmod "u=$umode,g=$gmode,o=$omode" "$upperdir" || die
+[ -n "$ls" ] || die 'empty ls output'
+owner=$(printf '%s\n' "$ls" | sed -e 's/^[^ ]* [^ ]* \([^ ]*\) \([^ ]*\).*$/\1:\2/;t;d')
+[ -n "$owner" ] || die 'bad ls owner output'
+mode=$(printf '%s\n' "$ls" | sed -e 's/^d\(...\)\(...\)\(...\).*/u=\1,g=\2,o=\3/;s/-//g;t;d')
+[ -n "$mode" ] || die 'bad ls mode output'
+cmdv chown "$owner" "$upperdir" || die
+cmdv chmod "$mode" "$upperdir" || die
 # -m - covers ACLs (system.posix_acl_access) and file caps
 # (security.capability). theoretically someone might have get/setcap and/or
 # get/setfacl but not get/setxattr, but this is unlikely since libcap/acl
@@ -237,16 +232,12 @@ if attrs=$(cd "$lastlowerdir" && getfattr -d -m - . 2>/dev/null); then
         printf '%s\n' "$attrs" | (cd "$upperdir"; setfattr --restore=-) || die
     fi
 else
-    log 'getfattr failed, skipping xattrs'
+    log 'getfattr failed, skipping xattrs/ACLs'
 fi
 
 logv 'mounting overlay'
-mount_opts="$no_canon $no_mtab $verbose"
 # shellcheck disable=SC2086
-cmdv mount $mount_opts -t overlay -o "$ovl_opts" "${mount_name-overlay}" "$dest" || die
-
-logv 'cleaning up'
-umount "$tmpdir" || exit
-rmdir "$tmpdir" || exit
-
+cmdv mount $no_canon $no_mtab $verbose -t overlay -o "$ovl_opts" "${mount_name-overlay}" "$dest" || die
+exec 9>&-
+wait || die
 logv 'done'

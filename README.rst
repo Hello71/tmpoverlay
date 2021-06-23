@@ -14,7 +14,7 @@ Benefits over manually calling ``mkdir /tmp/x; mount ...``
 - separate tmpfs allows size limit (``tmpoverlay -t size=SIZE``)
 - upperdir and workdir automatically managed
 - tmpfs cleanup after mount so that umount frees RAM
-- synchronizes owner, permissions, and xattrs (including lowerdir ACL)
+- synchronizes owner, permissions, and xattrs (including ACLs)
 - autodetects optimization flags (redirect_dir, metacopy, index, volatile)
 
 Overmounting
