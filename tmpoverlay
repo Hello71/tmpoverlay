@@ -134,9 +134,10 @@ esac
 mount -t tmpfs ${tmpfs_opts:+-o "$tmpfs_opts"} $verbose tmpfs "$tmpdir" || { rmdir "$tmpdir"; die; }
 mkfifo "$tmpdir/fifo" || { umount "$tmpdir"; rmdir "$tmpdir"; die; }
 # subshell allows cleanup after overmount /tmp without using realpath source
-# subshell also avoids trapping signals which is annoying in shell
+# subshell also avoids trapping and re-raising signals which is annoying in shell
 (
     cd "$tmpdir" || die
+    trap '' INT || die
     exec <fifo || die
     # read returns non-zero when write end is closed
     read _
