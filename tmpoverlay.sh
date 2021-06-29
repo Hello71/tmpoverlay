@@ -22,30 +22,23 @@ examples:
   tmpoverlay /etc              # make read-only /etc writable
   tmpoverlay /a /b /c /merged  # merge /a, /b, /c, and a fresh tmpfs
   tmpoverlay /                 # USE WITH CAUTION, see docs
+  unshare -Umc --keep-caps sh -c 'tmpoverlay . && exec \$SHELL' # make cwd writable as non-root
 EOF
     exit "$1"
 }
 
 log() {
-    logn "$@"
-    printf '\n' >&2
-}
-
-logn() {
     # not equivalent to printf "tmpoverlay: $@"
     printf 'tmpoverlay: ' >&2
     printf "$@" >&2
+    printf '\n' >&2
 }
 
 logv() {
     [ -z "$verbose" ] || log "$@"
 }
 
-logvn() {
-    [ -z "$verbose" ] || logn "$@"
-}
-
-cmdv() {
+cmd() {
     logv '%s ' "$@"
     "$@"
 }
@@ -126,17 +119,18 @@ dest=$(canon "$1")
 [ -n "$lowerdir" ] || lowerdir=$dest
 
 logv 'creating tmpdir'
-tmpdir=$(umask 077; mktemp -dt tmpoverlay.XXXXXXXXXX) || die
+tmpdir=$(cmd umask 077; cmd mktemp -dt tmpoverlay.XXXXXXXXXX) || die
 logv 'created tmpdir: %s' "$tmpdir"
+# won't trigger on overmounting /, which is actually correct
 case "$tmpdir" in
     "$dest"/*) log "warning: tmpdir cannot be cleaned up after overmounting $dest"
 esac
-mount -t tmpfs ${tmpfs_opts:+-o "$tmpfs_opts"} $verbose tmpfs "$tmpdir" || { rmdir "$tmpdir"; die; }
-mkfifo "$tmpdir/fifo" || { umount "$tmpdir"; rmdir "$tmpdir"; die; }
+cmd mount -t tmpfs ${tmpfs_opts:+-o "$tmpfs_opts"} $verbose tmpfs "$tmpdir" || { cmd rmdir "$tmpdir"; die; }
+cmd mkfifo "$tmpdir/fifo" || { cmd umount "$tmpdir"; cmd rmdir "$tmpdir"; die; }
 # subshell allows cleanup after overmount /tmp without using realpath source
 # subshell also avoids trapping and re-raising signals which is annoying in shell
 (
-    cd "$tmpdir" || die
+    cmd cd "$tmpdir" || die
     trap '' INT || die
     exec <fifo || die
     # read returns non-zero when write end is closed
@@ -144,10 +138,10 @@ mkfifo "$tmpdir/fifo" || { umount "$tmpdir"; rmdir "$tmpdir"; die; }
     logv 'unmounting tmpdir'
     # TODO: this *almost* works except umount insists on canonicalizing .
     # shellcheck disable=SC2086
-    umount -cil $no_mtab . || die
+    cmd umount -cil $no_mtab . || die
     logv 'deleting tmpdir'
-    cd /
-    rmdir "$tmpdir" || die
+    cmd cd /
+    cmd rmdir "$tmpdir" || die
 ) &
 # should be FD_CLOEXEC but can't do in shell
 exec 9>"$tmpdir/fifo"
@@ -156,17 +150,16 @@ exec 9>"$tmpdir/fifo"
 upperdir="$tmpdir/upper"
 workdir="$tmpdir/work"
 tmpmnt="$tmpdir/tmpmnt"
-logv 'creating dirs'
-mkdir "$upperdir" "$workdir" "$tmpmnt" || die
+cmd mkdir "$upperdir" "$workdir" "$tmpmnt" || die
 
 ovl_opts="lowerdir=$lowerdir,upperdir=$upperdir,workdir=$workdir"
 logv 'testing overlay options'
-mount -n -t overlay -o "$ovl_opts" overlay "$tmpmnt" || die "overlayfs is not supported"
-umount "$tmpmnt"
+cmd mount -n -t overlay -o "$ovl_opts" overlay "$tmpmnt" || die "overlayfs is not supported"
+cmd umount "$tmpmnt"
 if [ -n "$extra_ovl_opts" ]; then
     ovl_opts="$ovl_opts,$extra_ovl_opts"
-    mount -n -t overlay -o "$ovl_opts" overlay "$tmpmnt" || die "invalid extra overlayfs options"
-    umount "$tmpmnt" || die
+    cmd mount -n -t overlay -o "$ovl_opts" overlay "$tmpmnt" || die "invalid extra overlayfs options"
+    cmd umount "$tmpmnt" || die
 fi
 chk_ovl_opt() {
     if [ -n "$2" ]; then
@@ -187,20 +180,20 @@ try_ovl_opt() {
         *",$1[=,]"*) return 0
     esac
     if chk_ovl_opt "$1"; then
-        logv 'not checking %s'
+        logv 'skipping %s' "$1${2+=$2}"
         return
     fi
-    logvn 'trying %s... ' "$1${2+=$2}"
+    logv 'trying %s' "$1${2+=$2}"
     new_ovl_opts="$ovl_opts,$1${2+=$2}"
-    if ! cmdv mount -n -t overlay -o "$new_ovl_opts" "overlay" "$tmpmnt" 2>/dev/null; then
+    logv "mount -n -t overlay -o '$new_ovl_opts' overlay '$tmpmnt'"
+    if ! mount -n -t overlay -o "$new_ovl_opts" overlay "$tmpmnt" 2>/dev/null; then
         [ -z "$verbose" ] || echo rejected >&2
         return
     fi
-    [ -z "$verbose" ] || echo ok >&2
-    umount "$tmpmnt" || die
+    cmd umount "$tmpmnt" || die
     # clear out workdir/work/incompat/volatile and upperdir index
-    rm -r "$workdir" "$upperdir" || die
-    mkdir "$upperdir" "$workdir" || die
+    cmd rm -r "$workdir" "$upperdir" || die
+    cmd mkdir "$upperdir" "$workdir" || die
     ovl_opts="$new_ovl_opts"
 }
 try_ovl_opt index on
@@ -221,8 +214,14 @@ owner=$(printf '%s\n' "$ls" | sed -e 's/^[^ ]* [^ ]* \([^ ]*\) \([^ ]*\).*$/\1:\
 [ -n "$owner" ] || die 'bad ls owner output'
 mode=$(printf '%s\n' "$ls" | sed -e 's/^d\(...\)\(...\)\(...\).*/u=\1,g=\2,o=\3/;s/-//g;t;d')
 [ -n "$mode" ] || die 'bad ls mode output'
-cmdv chown "$owner" "$upperdir" || die
-cmdv chmod "$mode" "$upperdir" || die
+if ! cmd chown "$owner" "$upperdir"; then
+    # int sysctl can't be read by read
+    [ "$owner" = "$(dd if=/proc/sys/fs/overflowuid bs=16 status=none):$(dd if=/proc/sys/fs/overflowgid bs=16 status=none)" ] || die
+    read uid_old uid_new uid_cnt < /proc/self/uid_map
+    [ "$uid_old $uid_new" != "0 0" ] || die
+    log 'detected user namespace, ignoring chown failure'
+fi
+cmd chmod "$mode" "$upperdir" || die
 # -m - covers ACLs (system.posix_acl_access) and file caps
 # (security.capability). theoretically someone might have get/setcap and/or
 # get/setfacl but not get/setxattr, but this is unlikely since libcap/acl
@@ -238,7 +237,7 @@ fi
 
 logv 'mounting overlay'
 # shellcheck disable=SC2086
-cmdv mount $no_canon $no_mtab $verbose -t overlay -o "$ovl_opts" "${mount_name-overlay}" "$dest" || die
+cmd mount $no_canon $no_mtab $verbose -t overlay -o "$ovl_opts" "${mount_name-overlay}" "$dest" || die
 exec 9>&-
 wait || die
 logv 'done'
