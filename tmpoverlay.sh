@@ -30,6 +30,7 @@ EOF
 log() {
     # not equivalent to printf "tmpoverlay: $@"
     printf 'tmpoverlay: ' >&2
+    # shellcheck disable=SC2059
     printf "$@" >&2
     printf '\n' >&2
 }
@@ -134,7 +135,7 @@ cmd mkfifo "$tmpdir/fifo" || { cmd umount "$tmpdir"; cmd rmdir "$tmpdir"; die; }
     trap '' INT || die
     exec <fifo || die
     # read returns non-zero when write end is closed
-    read _
+    read -r _
     logv 'unmounting tmpdir'
     # TODO: this *almost* works except umount insists on canonicalizing .
     # shellcheck disable=SC2086
@@ -214,13 +215,7 @@ owner=$(printf '%s\n' "$ls" | sed -e 's/^[^ ]* [^ ]* \([^ ]*\) \([^ ]*\).*$/\1:\
 [ -n "$owner" ] || die 'bad ls owner output'
 mode=$(printf '%s\n' "$ls" | sed -e 's/^d\(...\)\(...\)\(...\).*/u=\1,g=\2,o=\3/;s/-//g;t;d')
 [ -n "$mode" ] || die 'bad ls mode output'
-if ! cmd chown "$owner" "$upperdir"; then
-    # int sysctl can't be read by read
-    [ "$owner" = "$(dd if=/proc/sys/fs/overflowuid bs=16 status=none):$(dd if=/proc/sys/fs/overflowgid bs=16 status=none)" ] || die
-    read uid_old uid_new uid_cnt < /proc/self/uid_map
-    [ "$uid_old $uid_new" != "0 0" ] || die
-    log 'detected user namespace, ignoring chown failure'
-fi
+cmd chown "$owner" "$upperdir" || die
 cmd chmod "$mode" "$upperdir" || die
 # -m - covers ACLs (system.posix_acl_access) and file caps
 # (security.capability). theoretically someone might have get/setcap and/or
